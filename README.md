@@ -84,7 +84,7 @@
 
 > “To improve the smoothness and avoid discrete switching between executing and observing, we query the policy at every timestep. This makes different action chunks overlap with each other, and at a given timestep there will be more than one predicted action.”（PDF p. 5）
 
-每次预测一整段动作，但每个控制时刻仍可重新推理，然后对“不同预测块针对同一目标时刻”的动作做指数加权融合。论文给出的合并形式是：
+<span style="color: orange;">每次预测一整段动作，但每个控制时刻仍可重新推理，然后对“不同预测块针对同一目标时刻”的动作做指数加权融合</span>。论文给出的合并形式是：
 
 $$
 a_t=\frac{\sum_i w_iA_t[i]}{\sum_iw_i},
@@ -101,7 +101,7 @@ $$
 
 ### 1.3 原论文系统图
 
-下图裁自 PDF p. 4，包含 ACT 的 CVAE 编码器/解码器结构，以及动作块与时间集成的执行示意。左半部分的 CVAE 编码器只在训练时使用，右半部分的解码器在测试时成为实际策略。
+下图裁自 PDF p. 4，包含 ACT 的 CVAE 编码器/解码器结构，以及动作块与时间集成的执行示意。<span style="color: orange;">左半部分的 CVAE 编码器只在训练时使用，右半部分的解码器在训练时和编码器一起使用，测试时则单独保留成为实际策略</span>。
 
 ![ACT 架构与时间集成](assets/aloha_act_architecture.png)
 
@@ -129,7 +129,17 @@ ALOHA 的一个训练样本由以下内容组成：
 
 ### 1.5 训练面
 
-ACT 使用条件 VAE。训练时，编码器接收动作块和本体状态，推断潜在变量 $z$；解码器以完整图像、本体状态和 $z$ 为条件输出动作块。测试时丢弃编码器，并令 $z=0$，因此部署路径仍是确定性的单次前向。
+ACT 使用条件 **VAE**<span style="color: orange;">（Variational Autoencoder，变分自编码器。普通自编码器一般是把输入压缩**编码**到一个隐变量，再从隐变量**解码**恢复输入，获得提炼后的输入，达到**提取特征/降维/去噪**的作用；**VAE** 则不是直接生成一个固定的隐向量，而是生成一个概率分布，然后从这个分布中采样隐变量，再由解码器重构输入。**训练目标主要有二**：解码器输出要接近原始输入；让隐变量分布接近标准正态分布）</span>。
+
+<span style="color: orange;">另外，还有 CVAE（Conditional VAE，条件变分自编码器），解码的部分不只根据隐变量生成动作，而是还依赖当前观测条件（图像与机器人状态）：$
+\text{观测 } o
++
+\text{隐变量 } z
+\longrightarrow
+\text{动作块 } a
+$。</span>
+
+<span style="color: orange;">**训练**时，**编码器**接收动作块和本体状态，推断潜在变量 $z$；**解码器**以完整图像、本体状态和 $z$ 为条件输出动作块</span>。<span style="color: orange;">测试时丢弃编码器，并令 $z=0$（表示测试时没有参考答案）</span>，因此部署路径仍是确定性的单次前向。
 
 图像经过 ResNet18 提取特征：
 
@@ -155,7 +165,7 @@ $$
 | CVAE 权重 $\beta$ | 10 |
 | Dropout | 0.1 |
 
-这里最值得 Infra 注意的是视觉 token 数量。1202 个 token 的 Transformer 编码带来近似二次的注意力成本；若增加相机、分辨率或输入历史，成本会明显上升。论文的四路相机全部送入一个长序列，简化了融合逻辑，但也限制了大 batch 训练。
+这里最值得 Infra 注意的是视觉 token 数量。1202 个 token 的 Transformer 编码带来近似二次的注意力成本；若增加相机、分辨率或输入历史，成本会明显上升。<span style="color: orange;">论文的四路相机全部送入一个长序列（一个样本会很大），简化了融合逻辑，但也限制了大 batch （大样本数）训练</span>。
 
 ### 1.6 推理与运行面
 
@@ -177,6 +187,26 @@ ACT 的推理路径可以拆成：
 - 动作块内部没有重新观察，遇到突然扰动时，后半段动作主要依赖底层控制器和之前的预测。
 
 这套架构很适合作为边缘侧设计参考：80M 参数、11 GB 显存即可训练，消费级 GPU 即可完成推理。真正的实时性风险来自多相机 I/O、Transformer 长序列、同步与端到端抖动，而不是模型参数本身。
+
+<span style="color: orange;">Action Chunking 决定模型一次预测多少步；  
+Temporal Ensemble 决定每一步执行时，如何处理不同时间、不同预测对同一个当前动作的意见。  
+如果没有 Temporal Ensemble，那就是一次预测 k 步，然后依次执行，k 步执行完了再预测；用 Temporal Ensemble 之后，则是这样（设 k = 4）：</span>
+
+1. $t=0$ 获取观测，预测 $a_0,a_1,a_2,a_3$，执行当前的 $a_0$。
+2. $t=1$ 获取新观测，再预测 $b_1,b_2,b_3,b_4$。现在模型对当前要执行的动作有两个预测：旧块中的 $a_1$ 和新块中的 $b_1$，将它们加权平均后执行。
+3. $t=2$ 再获取观测、重新预测；对时刻 2 的候选动作进行融合后执行。
+4. 之后每个控制步重复这一流程。
+
+<span style="color: orange;">**本人在这一步构思新的 idea**：  
+让执行长度 k 随当前状态变化，动态寻求最优 k。</span>
+
+一个可行的第一版方法是自适应执行长度：
+1. 模型仍然一次预测最多 $K$ 步的动作块。
+2. 每次只执行前 $r_t$ 步，其中 $1\le r_t\le K$。
+3. 执行完 $r_t$ 步后获取新观测，再预测下一块。
+4. 根据当前情况调整 $r_t$：动作预测越不确定、越接近接触或精细操作、环境变化越明显，就缩短执行长度；运动稳定、预测一致、推理资源紧张时，则适当加长。
+
+<span style="color: orange;">有一个有相似性的可参考论文</span>：https://openaccess.thecvf.com/content/CVPR2026/papers/Liang_Adaptive_Action_Chunking_at_Inference-time_for_Vision-Language-Action_Models_CVPR_2026_paper.pdf?utm_source=openai
 
 ### 1.7 资源与失效边界
 
